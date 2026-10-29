@@ -1,27 +1,23 @@
 #!/usr/bin/env python3
 """
-Telegram-бот для интерактивного полевого обхода магазинов Астаны.
+Telegram-бот для интерактивного полевого обхода магазинов и сбора аналитики оттока.
 
 Функции:
-  ▶️ Начать / Продолжить обход — карточка текущей точки с inline-кнопками
-  📋 Весь маршрут — список всех точек
-  📊 Скачать Excel-отчет — итоговый xlsx с аналитикой оттока
-  🔄 Сбросить прогресс — очистка состояния
-  📤 Отправить xlsx — расчёт маршрута
-  📍 Геолокация — пересчёт остатка маршрута от текущего местоположения
-
-Запуск:
-    pip install python-telegram-bot openpyxl requests
-    set BOT_TOKEN=ваш_токен   (или export BOT_TOKEN=...)
-    python tg_bot.py
+  ▶️ Начать / Продолжить обход — карточка текущей точки с кнопками WhatsApp, 2ГИС, GMaps
+  📋 Весь маршрут — полный список всех точек со статусами и ETA
+  📊 Скачать Excel-отчет — готовый xlsx с цветовой разметкой и листом «Аналитика оттока»
+  🔄 Сбросить прогресс — очистка статусов обхода
+  📤 Отправить xlsx — пересчёт маршрута
+  📍 Отправить геолокацию — пересчёт оставшихся точек от текущих координат
+  📸 Поддержка текста и фото при записи заметок из магазина
 """
 import asyncio
 import json
 import logging
 import os
+import re
 import sys
-from copy import deepcopy
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 from openpyxl import load_workbook, Workbook
@@ -52,7 +48,11 @@ OUT_FILE = WORK_DIR / "Маршрут_Астана_готовый.xlsx"
 SCRIPT = WORK_DIR / "route_planner.py"
 STATE_FILE = WORK_DIR / "visit_state.json"
 REPORT_FILE = WORK_DIR / "Маршрут_Астана_отчет.xlsx"
+PHOTOS_DIR = WORK_DIR / "photos"
 PYTHON = sys.executable
+
+# Среднее время пребывания в одной точке (парковка + разговор), минут
+AVG_SERVICE_MINS = 12
 
 logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
@@ -60,7 +60,6 @@ logging.basicConfig(
 )
 log = logging.getLogger("route-bot")
 
-# Состояния ConversationHandler
 WAITING_NOTE = 0
 
 MAIN_KB = ReplyKeyboardMarkup(
@@ -71,7 +70,19 @@ MAIN_KB = ReplyKeyboardMarkup(
     resize_keyboard=True,
 )
 
-# Теги причин оттока
+CITY_KB = InlineKeyboardMarkup(
+    [
+        [
+            InlineKeyboardButton("📍 Астана", callback_data="city:Астана"),
+            InlineKeyboardButton("📍 Алматы (скоро)", callback_data="city:Алматы"),
+        ],
+        [
+            InlineKeyboardButton("📍 Шымкент (скоро)", callback_data="city:Шымкент"),
+            InlineKeyboardButton("📍 Костанай (скоро)", callback_data="city:Костанай"),
+        ],
+    ]
+)
+
 REASON_TAGS = {
     "price": "💸 Цена/Тариф",
     "tech": "⚙️ Тех. проблемы/Баги",
@@ -79,158 +90,6 @@ REASON_TAGS = {
     "loyal": "🤝 Лояльны / Работают",
     "freetext": "✍️ Сразу текст",
 }
-
-
-# ══════════════════════════════════════════════════════════
-# ── Работа с состоянием обхода (visit_state.json) ────────
-# ══════════════════════════════════════════════════════════
-
-def _load_state() -> dict:
-    """Загружает состояние из JSON-файла."""
-    if STATE_FILE.exists():
-        with open(STATE_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
-    return {}
-
-
-def _save_state(state: dict):
-    """Сохраняет состояние на диск."""
-    with open(STATE_FILE, "w", encoding="utf-8") as f:
-        json.dump(state, f, ensure_ascii=False, indent=2)
-
-
-def _init_state_from_route():
-    """
-    Создаёт/обновляет visit_state.json из Маршрут_Астана_готовый.xlsx.
-    Сохраняет данные каждой точки + статус обхода.
-    Если точка уже была в state — сохраняет её данные визита.
-    """
-    points = _read_route_points()
-    if not points:
-        return {}
-
-    old_state = _load_state()
-    old_by_order = {str(p.get("order")): p for p in old_state.get("points", [])}
-
-    new_points = []
-    for p in points:
-        key = str(p["order"])
-        old = old_by_order.get(key, {})
-        new_points.append({
-            "order": p["order"],
-            "name": p["name"],
-            "addr": p["addr"],
-            "owner": p["owner"],
-            "contact": p["contact"],
-            "phone": p["phone"],
-            "mins": p["mins"],
-            "total": p["total"],
-            "src": p["src"],
-            "gmaps": p["gmaps"],
-            "dgis": p["dgis"],
-            "lat": p.get("lat"),
-            "lon": p.get("lon"),
-            # Статус визита (сохраняем старый если был)
-            "status": old.get("status", "pending"),
-            "visit_time": old.get("visit_time", ""),
-            "reason_tag": old.get("reason_tag", ""),
-            "notes": old.get("notes", ""),
-        })
-
-    state = {"points": new_points}
-    _save_state(state)
-    return state
-
-
-def _get_point_by_order(state: dict, order: int) -> dict | None:
-    """Находит точку по порядковому номеру."""
-    for p in state.get("points", []):
-        if p["order"] == order:
-            return p
-    return None
-
-
-def _first_pending(state: dict) -> dict | None:
-    """Первая точка со статусом 'pending'."""
-    for p in state.get("points", []):
-        if p["status"] == "pending":
-            return p
-    return None
-
-
-def _progress_summary(state: dict) -> str:
-    """Строка со сводкой прогресса."""
-    points = state.get("points", [])
-    total = len(points)
-    visited = sum(1 for p in points if p["status"] == "visited")
-    skipped = sum(1 for p in points if p["status"] == "skipped")
-    closed = sum(1 for p in points if p["status"] == "closed")
-    pending = sum(1 for p in points if p["status"] == "pending")
-    return (
-        f"📊 *Прогресс:* {visited} из {total} посещено\n"
-        f"   ✅ Посещено: {visited} | ⏭ Отложено: {skipped} | "
-        f"🔒 Закрыто: {closed} | ⏳ Ожидает: {pending}"
-    )
-
-
-# ══════════════════════════════════════════════════════════
-# ── Чтение xlsx ──────────────────────────────────────────
-# ══════════════════════════════════════════════════════════
-
-def _read_route_points():
-    """Читает точки из готового xlsx. Возвращает список dict."""
-    if not OUT_FILE.exists():
-        return []
-
-    wb = load_workbook(OUT_FILE)
-    ws = wb["Маршрут"]
-
-    points = []
-    for row in ws.iter_rows(min_row=2, max_col=11):
-        val = row[0].value
-        if val is None or not isinstance(val, int):
-            continue
-        gmaps = row[9].hyperlink.target if row[9].hyperlink else None
-        dgis = row[10].hyperlink.target if row[10].hyperlink else None
-
-        # Извлекаем координаты из ссылки Google Maps
-        lat, lon = None, None
-        if gmaps and "query=" in gmaps:
-            try:
-                coords_str = gmaps.split("query=")[1].split("&")[0]
-                lat, lon = [float(x) for x in coords_str.split(",")]
-            except (ValueError, IndexError):
-                pass
-
-        points.append(dict(
-            order=val,
-            name=row[1].value or "",
-            addr=row[2].value or "",
-            owner=row[3].value or "",
-            contact=row[4].value or "",
-            phone=row[5].value or "",
-            mins=row[6].value or 0,
-            total=row[7].value or 0,
-            src=row[8].value or "",
-            gmaps=gmaps,
-            dgis=dgis,
-            lat=lat,
-            lon=lon,
-        ))
-
-    return points
-
-
-# ══════════════════════════════════════════════════════════
-# ── Форматирование ───────────────────────────────────────
-# ══════════════════════════════════════════════════════════
-
-def _esc(text: str) -> str:
-    """Экранирует спец-символы Markdown v1 в тексте."""
-    for ch in ("_", "*", "`", "["):
-        text = text.replace(ch, "\\" + ch)
-    return text
-
 
 STATUS_EMOJI = {
     "pending": "⏳",
@@ -240,26 +99,259 @@ STATUS_EMOJI = {
 }
 
 
-def _card_text(p: dict) -> str:
-    """Формирует текст карточки точки для Telegram."""
-    status_em = STATUS_EMOJI.get(p["status"], "")
+# ══════════════════════════════════════════════════════════
+# ── Утилиты и работа с файлами ───────────────────────────
+# ══════════════════════════════════════════════════════════
+
+def _esc(text) -> str:
+    """Безопасное экранирование спецсимволов для Telegram Markdown v1."""
+    if text is None:
+        return ""
+    text = str(text)
+    for ch in ("_", "*", "`", "["):
+        text = text.replace(ch, "\\" + ch)
+    return text
+
+
+def _get_out_file() -> Path:
+    """Находит актуальный файл готового маршрута, учитывая возможные дубликаты при блокировке."""
+    if OUT_FILE.exists():
+        alts = sorted(WORK_DIR.glob("Маршрут_Астана_готовый_*.xlsx"), key=lambda p: p.stat().st_mtime, reverse=True)
+        if alts and alts[0].stat().st_mtime > OUT_FILE.stat().st_mtime:
+            return alts[0]
+        return OUT_FILE
+    alts = sorted(WORK_DIR.glob("Маршрут_Астана_готовый_*.xlsx"), key=lambda p: p.stat().st_mtime, reverse=True)
+    if alts:
+        return alts[0]
+    return OUT_FILE
+
+
+# ══════════════════════════════════════════════════════════
+# ── Работа с состоянием обхода (visit_state.json) ────────
+# ══════════════════════════════════════════════════════════
+
+def _point_uid(p: dict) -> str:
+    """Уникальный ключ магазина (Имя + Адрес), чтобы заметки не терялись при пересчёте маршрута."""
+    return f"{str(p.get('name', '')).strip()}|{str(p.get('addr', '')).strip()}"
+
+
+def _load_state() -> dict:
+    if STATE_FILE.exists():
+        try:
+            with open(STATE_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                if isinstance(data, dict):
+                    return data
+        except Exception as e:
+            log.error(f"Ошибка чтения state: {e}")
+    return {}
+
+
+def _save_state(state: dict):
+    try:
+        with open(STATE_FILE, "w", encoding="utf-8") as f:
+            json.dump(state, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        log.error(f"Ошибка записи state: {e}")
+
+
+def _init_state_from_route():
+    """
+    Создаёт или обновляет visit_state.json из Маршрут_Астана_готовый.xlsx.
+    Сопоставляет точки по уникальному ключу (name|addr), чтобы не терять заметки.
+    """
+    points = _read_route_points()
+    if not points:
+        return {}
+
+    old_state = _load_state()
+    old_by_uid = {_point_uid(p): p for p in old_state.get("points", [])}
+
+    new_points = []
+    for p in points:
+        uid = _point_uid(p)
+        old = old_by_uid.get(uid, {})
+        new_points.append(
+            {
+                "order": p["order"],
+                "name": p["name"],
+                "addr": p["addr"],
+                "owner": p["owner"],
+                "contact": p["contact"],
+                "phone": p["phone"],
+                "mins": p["mins"],
+                "total": p["total"],
+                "src": p["src"],
+                "gmaps": p["gmaps"],
+                "dgis": p["dgis"],
+                "lat": p.get("lat"),
+                "lon": p.get("lon"),
+                "status": old.get("status", "pending"),
+                "visit_time": old.get("visit_time", ""),
+                "reason_tag": old.get("reason_tag", ""),
+                "notes": old.get("notes", ""),
+                "photo": old.get("photo", ""),
+            }
+        )
+
+    state = {
+        "city": old_state.get("city", "Астана"),
+        "points": new_points,
+    }
+    _save_state(state)
+    return state
+
+
+def _get_point_by_order(state: dict, order: int | None) -> dict | None:
+    if order is None:
+        return None
+    for p in state.get("points", []):
+        if p.get("order") == order:
+            return p
+    return None
+
+
+def _next_to_visit(state: dict) -> tuple[dict | None, bool]:
+    """
+    Возвращает (point, is_from_skipped).
+    Сначала ищет 'pending', а если они закончились — возвращает первую 'skipped'.
+    """
+    pts = state.get("points", [])
+    for p in pts:
+        if p.get("status") == "pending":
+            return p, False
+    for p in pts:
+        if p.get("status") == "skipped":
+            return p, True
+    return None, False
+
+
+def _progress_summary(state: dict) -> str:
+    points = state.get("points", [])
+    total = len(points)
+    visited = sum(1 for p in points if p.get("status") == "visited")
+    skipped = sum(1 for p in points if p.get("status") == "skipped")
+    closed = sum(1 for p in points if p.get("status") == "closed")
+    pending = sum(1 for p in points if p.get("status") == "pending")
+
+    rem_pts = [p for p in points if p.get("status") in ("pending", "skipped")]
+    rem_drive = sum(p.get("mins", 0) for p in rem_pts)
+    rem_total_mins = rem_drive + len(rem_pts) * AVG_SERVICE_MINS
+    eta_str = ""
+    if rem_pts:
+        eta_dt = datetime.now() + timedelta(minutes=rem_total_mins)
+        eta_str = (
+            f"\n🏁 *Прогноз завершения ({len(rem_pts)} точ.):* "
+            f"≈ {eta_dt:%H:%M} (~{rem_total_mins} мин с визитами)"
+        )
+
+    return (
+        f"📊 *Прогресс:* {visited + closed} из {total} закрыто\n"
+        f"   ✅ Посещено: {visited} | ⏭ Отложено: {skipped} | "
+        f"🔒 Закрыто: {closed} | ⏳ Ожидает: {pending}"
+        f"{eta_str}"
+    )
+
+
+# ══════════════════════════════════════════════════════════
+# ── Чтение xlsx ──────────────────────────────────────────
+# ══════════════════════════════════════════════════════════
+
+def _read_route_points():
+    cur_file = _get_out_file()
+    if not cur_file.exists():
+        return []
+
+    try:
+        wb = load_workbook(cur_file)
+    except Exception as e:
+        log.error(f"Не удалось загрузить workbook {cur_file}: {e}")
+        return []
+
+    if "Маршрут" not in wb.sheetnames:
+        return []
+
+    ws = wb["Маршрут"]
+    points = []
+    for row in ws.iter_rows(min_row=2, max_col=11):
+        val = row[0].value
+        if val is None or not isinstance(val, int):
+            continue
+        gmaps = row[9].hyperlink.target if row[9].hyperlink else None
+        dgis = row[10].hyperlink.target if row[10].hyperlink else None
+
+        lat, lon = None, None
+        if gmaps and "query=" in gmaps:
+            try:
+                coords_str = gmaps.split("query=")[1].split("&")[0]
+                lat, lon = [float(x) for x in coords_str.split(",")]
+            except (ValueError, IndexError):
+                pass
+
+        points.append(
+            dict(
+                order=val,
+                name=str(row[1].value or ""),
+                addr=str(row[2].value or ""),
+                owner=str(row[3].value or ""),
+                contact=str(row[4].value or ""),
+                phone=str(row[5].value or ""),
+                mins=int(row[6].value or 0),
+                total=int(row[7].value or 0),
+                src=str(row[8].value or ""),
+                gmaps=gmaps or "",
+                dgis=dgis or "",
+                lat=lat,
+                lon=lon,
+            )
+        )
+    return points
+
+
+# ══════════════════════════════════════════════════════════
+# ── Форматирование карточки ──────────────────────────────
+# ══════════════════════════════════════════════════════════
+
+def _whatsapp_url(phone_raw: str) -> str | None:
+    digits = re.sub(r"\D", "", str(phone_raw))
+    if not digits:
+        return None
+    if digits.startswith("8") and len(digits) == 11:
+        digits = "7" + digits[1:]
+    if len(digits) >= 10:
+        return f"https://wa.me/{digits}"
+    return None
+
+
+def _card_text(p: dict, state: dict) -> str:
+    status_em = STATUS_EMOJI.get(p.get("status", "pending"), "")
     lines = [
-        f"*{p['order']}.* {_esc(p['name'])} {status_em}",
-        f"📍 {_esc(p['addr'])}",
+        f"*{p['order']}.* {_esc(p.get('name', ''))} {status_em}",
+        f"📍 {_esc(p.get('addr', ''))}",
     ]
+
+    next_p = _get_point_by_order(state, p["order"] + 1)
+    if next_p and next_p.get("mins", 0) == 0:
+        lines.append(f"🏢 *В этом же здании/рядом:* {_esc(next_p.get('name', ''))}")
+
     if p.get("owner"):
         lines.append(f"👤 Владелец: {_esc(p['owner'])}")
     if p.get("contact"):
         lines.append(f"🧑‍💼 Контакт: {_esc(p['contact'])}")
     if p.get("phone"):
-        lines.append(f"📞 {_esc(p['phone'])}")
+        wa = _whatsapp_url(p["phone"])
+        if wa:
+            lines.append(f"📞 {_esc(p['phone'])} · [💬 WhatsApp]({wa})")
+        else:
+            lines.append(f"📞 {_esc(p['phone'])}")
 
     if p["order"] == 1:
         lines.append("🏁 СТАРТ")
+    elif p.get("mins", 0) == 0:
+        lines.append(f"⏱ 0 мин (в том же месте, всего в пути {p.get('total', 0)} мин)")
     else:
-        lines.append(f"⏱ +{p['mins']} мин от предыдущей (всего {p['total']})")
+        lines.append(f"⏱ +{p.get('mins', 0)} мин езды (всего в пути {p.get('total', 0)} мин)")
 
-    # Ссылки
     links = []
     if p.get("gmaps"):
         links.append(f"[Google Maps]({p['gmaps']})")
@@ -268,39 +360,39 @@ def _card_text(p: dict) -> str:
     if links:
         lines.append("🔗 " + " · ".join(links))
 
-    # Заметка если есть
-    if p.get("notes"):
-        lines.append(f"\n💬 _{_esc(p['notes'])}_")
     if p.get("reason_tag"):
-        lines.append(f"🏷 {p['reason_tag']}")
+        lines.append(f"\n🏷 Категория: *{_esc(p['reason_tag'])}*")
+    if p.get("notes"):
+        # Без обрамления в курсив, чтобы не ломался Markdown при переносах строк
+        lines.append(f"💬 Заметка: {_esc(p['notes'])}")
+    if p.get("photo"):
+        lines.append(f"📸 Прикреплено фото: {_esc(p['photo'])}")
     if p.get("visit_time"):
-        lines.append(f"🕐 {p['visit_time']}")
+        lines.append(f"🕐 Время визита: {_esc(p['visit_time'])}")
 
     return "\n".join(lines)
 
 
-def _card_keyboard(p: dict) -> InlineKeyboardMarkup:
-    """Inline-клавиатура под карточкой точки."""
+def _card_keyboard(p: dict, total: int) -> InlineKeyboardMarkup:
     order = p["order"]
-    state = _load_state()
-    total = len(state.get("points", []))
-
     buttons = []
 
-    if p["status"] == "visited":
-        buttons.append([
-            InlineKeyboardButton("✍️ Дополнить заметку", callback_data=f"visit:{order}")
-        ])
+    if p.get("status") == "visited":
+        buttons.append(
+            [InlineKeyboardButton("✍️ Дополнить заметку / фото", callback_data=f"visit:{order}")]
+        )
     else:
-        buttons.append([
-            InlineKeyboardButton("✅ Записать итог / Заметку", callback_data=f"visit:{order}")
-        ])
-    buttons.append([
-        InlineKeyboardButton("⏭ Отложить на потом", callback_data=f"skip:{order}"),
-        InlineKeyboardButton("🔒 Магазин закрыт", callback_data=f"closed:{order}"),
-    ])
+        buttons.append(
+            [InlineKeyboardButton("✅ Записать итог / Заметку", callback_data=f"visit:{order}")]
+        )
 
-    # Навигация
+    buttons.append(
+        [
+            InlineKeyboardButton("⏭ Отложить на потом", callback_data=f"skip:{order}"),
+            InlineKeyboardButton("🔒 Магазин закрыт", callback_data=f"closed:{order}"),
+        ]
+    )
+
     nav = []
     if order > 1:
         nav.append(InlineKeyboardButton("⬅️ Пред.", callback_data=f"nav:{order - 1}"))
@@ -318,42 +410,59 @@ def _card_keyboard(p: dict) -> InlineKeyboardMarkup:
 
 def export_report_xlsx() -> Path:
     """
-    Берёт Маршрут_Астана_готовый.xlsx, добавляет столбцы отчёта
-    и лист аналитики оттока. Возвращает путь к файлу.
+    Пересобирает лист «Маршрут» строго по актуальному порядку state['points']
+    и добавляет лист «Аналитика оттока».
     """
     state = _load_state()
-    points_state = {p["order"]: p for p in state.get("points", [])}
+    all_points = state.get("points", [])
 
-    wb = load_workbook(OUT_FILE)
-    ws = wb["Маршрут"]
+    cur_file = _get_out_file()
+    if cur_file.exists():
+        try:
+            wb = load_workbook(cur_file)
+        except Exception:
+            wb = Workbook()
+    else:
+        wb = Workbook()
+
+    if "Маршрут" in wb.sheetnames:
+        del wb["Маршрут"]
+    ws = wb.create_sheet("Маршрут", 0)
+
+    # Удаляем пустой лист по умолчанию, если он был создан
+    if "Sheet" in wb.sheetnames and len(wb.sheetnames) > 1:
+        del wb["Sheet"]
 
     F = "Arial"
     hf = PatternFill("solid", fgColor="1F3A5F")
 
-    # Заголовки новых столбцов (L=12, M=13, N=14, O=15)
-    new_headers = ["Статус", "Время визита", "Категория / Причина",
-                   "Комментарий / Что сказали в магазине"]
-    for col_idx, header in enumerate(new_headers, 12):
-        cell = ws.cell(1, col_idx, header)
-        cell.font = Font(name=F, bold=True, color="FFFFFF")
-        cell.fill = hf
-        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    headers = [
+        "Порядок",
+        "Точка",
+        "Адрес",
+        "Владелец",
+        "Контакт",
+        "Телефон",
+        "Минут от предыдущей",
+        "Всего минут",
+        "Откуда координаты",
+        "Google Maps",
+        "2ГИС",
+        "Статус",
+        "Время визита",
+        "Категория / Причина",
+        "Комментарий / Что сказали в магазине",
+    ]
+    ws.append(headers)
 
-    # Ширины новых столбцов
-    ws.column_dimensions["L"].width = 14
-    ws.column_dimensions["M"].width = 18
-    ws.column_dimensions["N"].width = 22
-    ws.column_dimensions["O"].width = 50
-
-    # Цвета заливки
-    fill_visited = PatternFill("solid", fgColor="C6EFCE")   # зелёный
-    fill_skipped = PatternFill("solid", fgColor="FFEB9C")   # жёлтый
-    fill_closed = PatternFill("solid", fgColor="FFC7CE")    # красный
-    fill_pending = PatternFill("solid", fgColor="D9E1F2")   # голубой
+    fill_visited = PatternFill("solid", fgColor="C6EFCE")
+    fill_skipped = PatternFill("solid", fgColor="FFEB9C")
+    fill_closed = PatternFill("solid", fgColor="FFC7CE")
+    fill_pending = PatternFill("solid", fgColor="D9E1F2")
 
     STATUS_RU = {
         "visited": "Посетил",
-        "skipped": "Пропущено",
+        "skipped": "Отложено",
         "closed": "Закрыто",
         "pending": "Ожидает",
     }
@@ -364,57 +473,82 @@ def export_report_xlsx() -> Path:
         "pending": fill_pending,
     }
 
-    for row in ws.iter_rows(min_row=2, max_col=1):
-        order_val = row[0].value
-        if order_val is None or not isinstance(order_val, int):
-            continue
-        r = row[0].row
-        ps = points_state.get(order_val, {})
-        status = ps.get("status", "pending")
+    for p in all_points:
+        status = p.get("status", "pending")
+        note_full = p.get("notes", "")
+        if p.get("photo"):
+            note_full = (note_full + f" [Фото: {p['photo']}]").strip()
 
-        # Столбец L — Статус
-        cell_status = ws.cell(r, 12, STATUS_RU.get(status, status))
+        ws.append(
+            [
+                p["order"],
+                p.get("name", ""),
+                p.get("addr", ""),
+                p.get("owner", ""),
+                p.get("contact", ""),
+                p.get("phone", ""),
+                p.get("mins", 0),
+                p.get("total", 0),
+                p.get("src", ""),
+                "Открыть" if p.get("gmaps") else "",
+                "Открыть" if p.get("dgis") else "",
+                STATUS_RU.get(status, status),
+                p.get("visit_time", ""),
+                p.get("reason_tag", ""),
+                note_full,
+            ]
+        )
+        r = ws.max_row
+        if p.get("gmaps"):
+            ws.cell(r, 10).hyperlink = p["gmaps"]
+            ws.cell(r, 10).font = Font(name=F, color="0563C1", underline="single")
+        if p.get("dgis"):
+            ws.cell(r, 11).hyperlink = p["dgis"]
+            ws.cell(r, 11).font = Font(name=F, color="0563C1", underline="single")
+
+        cell_status = ws.cell(r, 12)
         cell_status.fill = STATUS_FILL.get(status, fill_pending)
-        cell_status.font = Font(name=F, size=11)
         cell_status.alignment = Alignment(horizontal="center", vertical="center")
 
-        # Столбец M — Время визита
-        cell_time = ws.cell(r, 13, ps.get("visit_time", ""))
-        cell_time.font = Font(name=F, size=11)
-        cell_time.alignment = Alignment(horizontal="center", vertical="center")
+    for c in ws[1]:
+        c.font = Font(name=F, bold=True, color="FFFFFF")
+        c.fill = hf
+        c.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
 
-        # Столбец N — Категория
-        cell_reason = ws.cell(r, 14, ps.get("reason_tag", ""))
-        cell_reason.font = Font(name=F, size=11)
-        cell_reason.alignment = Alignment(vertical="center", wrap_text=True)
+    for row in ws.iter_rows(min_row=2, max_col=15):
+        for idx_c, c in enumerate(row, 1):
+            if idx_c not in (10, 11):
+                c.font = Font(name=F, size=11)
+            if idx_c in (1, 7, 8, 12, 13):
+                c.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+            else:
+                c.alignment = Alignment(vertical="center", wrap_text=True)
 
-        # Столбец O — Комментарий
-        cell_notes = ws.cell(r, 15, ps.get("notes", ""))
-        cell_notes.font = Font(name=F, size=11)
-        cell_notes.alignment = Alignment(vertical="center", wrap_text=True)
+    widths = [8, 26, 38, 24, 22, 18, 12, 11, 14, 13, 10, 14, 18, 24, 52]
+    for col_letter, w in zip("ABCDEFGHIJKLMNO", widths):
+        ws.column_dimensions[col_letter].width = w
+    ws.freeze_panes = "C2"
 
     # ── Лист «Аналитика оттока» ──
     if "Аналитика оттока" in wb.sheetnames:
         del wb["Аналитика оттока"]
     an = wb.create_sheet("Аналитика оттока")
 
-    all_points = state.get("points", [])
     total = len(all_points)
-    visited = [p for p in all_points if p["status"] == "visited"]
-    skipped = [p for p in all_points if p["status"] == "skipped"]
-    closed = [p for p in all_points if p["status"] == "closed"]
-    pending = [p for p in all_points if p["status"] == "pending"]
+    visited = [p for p in all_points if p.get("status") == "visited"]
+    skipped = [p for p in all_points if p.get("status") == "skipped"]
+    closed = [p for p in all_points if p.get("status") == "closed"]
+    pending = [p for p in all_points if p.get("status") == "pending"]
 
     an.append(["Показатель", "Количество"])
-    an.append(["Всего точек", total])
-    an.append(["Посещено", len(visited)])
+    an.append(["Всего точек в маршруте", total])
+    an.append(["Посещено (успешный визит)", len(visited)])
     an.append(["Отложено", len(skipped)])
-    an.append(["Закрыто", len(closed)])
-    an.append(["Ожидает", len(pending)])
+    an.append(["Магазин закрыт", len(closed)])
+    an.append(["Ожидает посещения", len(pending)])
     an.append([])
-    an.append(["Разбивка по причинам оттока", "Количество"])
+    an.append(["Разбивка по причинам оттока / категориям", "Количество"])
 
-    # Считаем причины
     reason_counts = {}
     for p in all_points:
         tag = p.get("reason_tag", "")
@@ -424,30 +558,21 @@ def export_report_xlsx() -> Path:
         for reason, count in sorted(reason_counts.items(), key=lambda x: -x[1]):
             an.append([reason, count])
     else:
-        an.append(["(нет данных)", 0])
+        an.append(["(пока нет отмеченных категорий)", 0])
 
-    # Стили
     for c in an[1]:
         c.font = Font(name=F, bold=True, color="FFFFFF")
         c.fill = hf
         c.alignment = Alignment(horizontal="center", vertical="center")
-    row8 = an[8]
-    if row8:
-        for c in row8:
-            if c.value:
-                c.font = Font(name=F, bold=True, color="FFFFFF")
-                c.fill = hf
-                c.alignment = Alignment(horizontal="center", vertical="center")
+    for c in an[8]:
+        if c.value:
+            c.font = Font(name=F, bold=True, color="FFFFFF")
+            c.fill = hf
+            c.alignment = Alignment(horizontal="center", vertical="center")
 
-    an.column_dimensions["A"].width = 35
-    an.column_dimensions["B"].width = 14
+    an.column_dimensions["A"].width = 40
+    an.column_dimensions["B"].width = 16
 
-    for row in an.iter_rows(min_row=2, max_col=2):
-        for c in row:
-            if c.font == Font():
-                c.font = Font(name=F, size=11)
-
-    # Сохранение
     try:
         wb.save(str(REPORT_FILE))
     except PermissionError:
@@ -462,15 +587,48 @@ def export_report_xlsx() -> Path:
 # ══════════════════════════════════════════════════════════
 
 async def cmd_start(update: Update, _ctx: ContextTypes.DEFAULT_TYPE):
+    welcome_text = (
+        "👋 *Привет! Это бот-ассистент для умного объезда торговых точек и сбора обратной связи.*\n\n"
+        "Я строю самый быстрый маршрут по дорогам, веду по точкам и сохраняю ваши заметки "
+        "прямо в готовый Excel-отчет.\n\n"
+        "📌 *Мини-инструкция, как работать:*\n"
+        "1️⃣ *Выберите город* на кнопках ниже.\n"
+        "2️⃣ *Отправьте .xlsx файл* со списком магазинов (первая строка — ваш СТАРТ).\n"
+        "3️⃣ *Нажмите «▶️ Начать / Продолжить обход»* — откроется карточка с кнопками *WhatsApp*, *2ГИС* и *Google Maps*.\n"
+        "4️⃣ *Фиксируйте итоги* — отмечайте статус визита и пишите текстом (или присылайте фото), почему клиент перешел на другую систему.\n"
+        "5️⃣ *Геолокация* — если отклонились от маршрута, отправьте свою 📍 геопозицию, и я пересчитаю оставшиеся точки.\n"
+        "6️⃣ *Скачайте отчет* — в любой момент заберите готовый Excel со всеми комментариями и аналитикой.\n\n"
+        "🏙 *Выберите ваш город:* 👇"
+    )
     await update.message.reply_text(
-        "👋 *Бот полевого обхода магазинов Астаны*\n\n"
-        "▶️ *Начать / Продолжить обход* — карточка текущей точки\n"
-        "📋 *Весь маршрут* — список всех точек\n"
-        "📊 *Скачать Excel-отчет* — итоговый файл\n"
-        "🔄 *Сбросить прогресс* — начать сначала\n"
-        "📤 Отправьте *.xlsx* — пересчитаю маршрут\n"
-        "📍 Отправьте *геолокацию* — пересчёт от вашей точки\n\n"
-        "Все ссылки Google Maps и 2ГИС кликабельны 👆",
+        welcome_text,
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=MAIN_KB,
+    )
+    await update.message.reply_text(
+        "Доступные города:",
+        reply_markup=CITY_KB,
+    )
+
+
+async def cb_city_select(update: Update, _ctx: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    _, city = query.data.split(":", 1)
+
+    if city != "Астана":
+        await query.message.reply_text(
+            f"🚧 Город *{_esc(city)}* скоро будет подключен! Пока активен модуль по *г. Астана*.",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+
+    state = _load_state()
+    state["city"] = city
+    _save_state(state)
+    await query.message.reply_text(
+        f"✅ Выбран город: *{_esc(city)}*.\n"
+        "Отправьте файл `.xlsx` для расчёта или нажмите *▶️ Начать / Продолжить обход*.",
         parse_mode=ParseMode.MARKDOWN,
         reply_markup=MAIN_KB,
     )
@@ -491,7 +649,7 @@ async def cmd_show_all(update: Update, _ctx: ContextTypes.DEFAULT_TYPE):
 
     msgs, buf = [], ["🗺 *Маршрут по Астане*\n"]
     for p in points:
-        em = STATUS_EMOJI.get(p["status"], "")
+        em = STATUS_EMOJI.get(p.get("status", "pending"), "")
         links = []
         if p.get("gmaps"):
             links.append(f'[GMaps]({p["gmaps"]})')
@@ -502,23 +660,24 @@ async def cmd_show_all(update: Update, _ctx: ContextTypes.DEFAULT_TYPE):
         if p["order"] == 1:
             time_s = "🏁 СТАРТ"
         else:
-            time_s = f"⏱ +{p['mins']} мин  (всего {p['total']})"
+            time_s = f"⏱ +{p.get('mins', 0)} мин  (всего {p.get('total', 0)})"
+
+        note_preview = f"\n   💬 {_esc(p['notes'])}" if p.get("notes") else ""
 
         block = (
-            f"*{p['order']}.* {_esc(p['name'])} {em}\n"
-            f"   📍 {_esc(p['addr'])}\n"
-            f"   {time_s}\n"
-            f"   {lnk}\n"
+            f"*{p['order']}.* {_esc(p.get('name', ''))} {em}\n"
+            f"   📍 {_esc(p.get('addr', ''))}\n"
+            f"   {time_s}  {lnk}{note_preview}\n"
         )
 
         joined = "\n".join(buf) + "\n" + block
         if len(joined) > 3800:
             msgs.append("\n".join(buf))
-            buf = ["🗺 *Продолжение*\n"]
+            buf = ["🗺 *Продолжение маршрута*\n"]
         buf.append(block)
 
     total_time = points[-1].get("total", 0) if points else 0
-    buf.append(f"\n⏱ *Общее время в пути: ≈ {total_time} мин*")
+    buf.append(f"\n⏱ *Чистое время за рулём: ≈ {total_time} мин*")
     buf.append("\n" + _progress_summary(state))
     msgs.append("\n".join(buf))
 
@@ -532,68 +691,73 @@ async def cmd_show_all(update: Update, _ctx: ContextTypes.DEFAULT_TYPE):
 
 # ── Начать/Продолжить обход ──────────────────────────────
 
-async def _send_point_card(target, state: dict, order: int | None = None):
-    """
-    Отправляет карточку точки. target — Message или CallbackQuery.
-    Если order не указан, берёт первую pending.
-    """
+async def _send_point_card(target, state: dict, order: int | None = None, edit: bool = False):
+    total = len(state.get("points", []))
+    is_from_skipped = False
+
     if order is not None:
         p = _get_point_by_order(state, order)
     else:
-        p = _first_pending(state)
+        p, is_from_skipped = _next_to_visit(state)
+
+    msg_obj = getattr(target, "message", None) or target
 
     if p is None:
-        text = "🎉 *Все точки пройдены\\!*\n\n" + _progress_summary(state)
-        if hasattr(target, "message"):
-            await target.message.reply_text(
-                text, parse_mode=ParseMode.MARKDOWN, reply_markup=MAIN_KB
-            )
-        else:
-            await target.reply_text(
-                text, parse_mode=ParseMode.MARKDOWN, reply_markup=MAIN_KB
-            )
+        text = "🎉 *Все точки маршрута пройдены!*\n\n" + _progress_summary(state)
+        await msg_obj.reply_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=MAIN_KB)
         return None
 
-    text = _card_text(p)
-    kb = _card_keyboard(p)
+    prefix = "🔄 *Возвращаемся к отложенной точке:*\n\n" if is_from_skipped else ""
+    text = prefix + _card_text(p, state)
+    kb = _card_keyboard(p, total)
 
-    if hasattr(target, "message") and target.message:
-        # CallbackQuery
-        await target.message.reply_text(
-            text, parse_mode=ParseMode.MARKDOWN,
-            disable_web_page_preview=True, reply_markup=kb
-        )
-    else:
-        await target.reply_text(
-            text, parse_mode=ParseMode.MARKDOWN,
-            disable_web_page_preview=True, reply_markup=kb
-        )
+    if edit and hasattr(target, "edit_message_text"):
+        try:
+            await target.edit_message_text(
+                text,
+                parse_mode=ParseMode.MARKDOWN,
+                disable_web_page_preview=True,
+                reply_markup=kb,
+            )
+            return p
+        except Exception:
+            pass
+
+    await msg_obj.reply_text(
+        text,
+        parse_mode=ParseMode.MARKDOWN,
+        disable_web_page_preview=True,
+        reply_markup=kb,
+    )
     return p
 
 
 async def cmd_start_walk(update: Update, _ctx: ContextTypes.DEFAULT_TYPE):
     state = _load_state()
     if not state.get("points"):
-        await update.message.reply_text(
-            "📤 Сначала отправьте xlsx-файл с адресами.",
-            reply_markup=MAIN_KB,
-        )
-        return
+        cur_file = _get_out_file()
+        if cur_file.exists():
+            state = _init_state_from_route()
+        else:
+            await update.message.reply_text(
+                "📤 Сначала отправьте xlsx-файл с адресами.",
+                reply_markup=MAIN_KB,
+            )
+            return
 
     result = await _send_point_card(update.message, state)
     if result is None:
-        # Все пройдены — предлагаем скачать отчёт
         await _auto_send_report(update.message)
 
 
-async def _auto_send_report(message):
-    """Автоматическая отправка отчёта при завершении обхода."""
+async def _auto_send_report(message_or_target):
     try:
         report_path = export_report_xlsx()
+        msg_obj = getattr(message_or_target, "message", None) or message_or_target
         with open(report_path, "rb") as f:
-            await message.reply_document(
+            await msg_obj.reply_document(
                 document=InputFile(f, filename="Маршрут_Астана_отчет.xlsx"),
-                caption="📊 Итоговый отчёт обхода — автоматически сформирован",
+                caption="📊 Итоговый отчёт обхода со всеми заметками и аналитикой оттока",
             )
     except Exception as e:
         log.error(f"Ошибка автоотчёта: {e}")
@@ -602,36 +766,39 @@ async def _auto_send_report(message):
 # ── Callback-кнопки навигации, skip, closed ──────────────
 
 async def cb_navigation(update: Update, _ctx: ContextTypes.DEFAULT_TYPE):
-    """Обработка nav:{order} — переключение между точками."""
     query = update.callback_query
     await query.answer()
     _, order_str = query.data.split(":", 1)
-    order = int(order_str)
     state = _load_state()
-    await _send_point_card(query, state, order)
+    await _send_point_card(query, state, int(order_str), edit=True)
 
 
 async def cb_skip(update: Update, _ctx: ContextTypes.DEFAULT_TYPE):
-    """Обработка skip:{order} — отложить на потом."""
     query = update.callback_query
-    await query.answer("⏭ Отложено")
+    await query.answer("⏭ Точка отложена на конец маршрута")
     _, order_str = query.data.split(":", 1)
     order = int(order_str)
 
     state = _load_state()
     p = _get_point_by_order(state, order)
-    if p and p["status"] in ("pending", "skipped"):
+    if p and p.get("status") in ("pending", "skipped"):
         p["status"] = "skipped"
         _save_state(state)
 
-    # Показать следующую pending
-    await _send_point_card(query, state)
+    pts = state.get("points", [])
+    next_pending = next((pt for pt in pts if pt.get("status") == "pending" and pt.get("order", 0) > order), None)
+    if not next_pending:
+        next_pending = next((pt for pt in pts if pt.get("status") == "pending"), None)
+
+    if next_pending:
+        await _send_point_card(query, state, next_pending["order"])
+    else:
+        await _send_point_card(query, state)
 
 
 async def cb_closed(update: Update, _ctx: ContextTypes.DEFAULT_TYPE):
-    """Обработка closed:{order} — магазин закрыт."""
     query = update.callback_query
-    await query.answer("🔒 Отмечено как закрытый")
+    await query.answer("🔒 Отмечено: Магазин закрыт")
     _, order_str = query.data.split(":", 1)
     order = int(order_str)
 
@@ -642,13 +809,13 @@ async def cb_closed(update: Update, _ctx: ContextTypes.DEFAULT_TYPE):
         p["visit_time"] = datetime.now().strftime("%Y-%m-%d %H:%M")
         _save_state(state)
 
-    summary = _progress_summary(state)
-    await query.message.reply_text(summary, parse_mode=ParseMode.MARKDOWN)
+    await query.message.reply_text(_progress_summary(state), parse_mode=ParseMode.MARKDOWN)
 
-    # Проверяем завершение
-    if _first_pending(state) is None:
+    next_p, _ = _next_to_visit(state)
+    if next_p is None:
         await query.message.reply_text(
-            "🎉 *Все точки пройдены\\!*", parse_mode=ParseMode.MARKDOWN,
+            "🎉 *Все точки маршрута пройдены!*",
+            parse_mode=ParseMode.MARKDOWN,
             reply_markup=MAIN_KB,
         )
         await _auto_send_report(query.message)
@@ -659,36 +826,37 @@ async def cb_closed(update: Update, _ctx: ContextTypes.DEFAULT_TYPE):
 # ── Диалог визита (ConversationHandler) ──────────────────
 
 async def cb_visit_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """
-    visit:{order} — начало диалога фиксации визита.
-    Показывает inline-кнопки с тегами причин.
-    """
     query = update.callback_query
     await query.answer()
     _, order_str = query.data.split(":", 1)
     order = int(order_str)
 
     ctx.user_data["visit_order"] = order
-
     state = _load_state()
     p = _get_point_by_order(state, order)
-    is_append = p and p["status"] == "visited"
+    is_append = p and p.get("status") == "visited"
+    p_name = _esc(p.get("name", "")) if p else f"Точка {order}"
 
-    prompt = "✍️ Дополните заметку — выберите тег:" if is_append else "Выберите категорию:"
+    prompt = (
+        f"✍️ Дополнение по точке *{order}. {p_name}* — выберите категорию (или сразу отправьте текст/фото):"
+        if is_append
+        else f"🏷 Точка *{order}. {p_name}* — выберите причину/категорию (или сразу напишите текст в чат):"
+    )
 
-    kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton("💸 Цена/Тариф", callback_data="tag:price")],
-        [InlineKeyboardButton("⚙️ Тех. проблемы/Баги", callback_data="tag:tech")],
-        [InlineKeyboardButton("🔄 Ушли к конкуренту", callback_data="tag:competitor")],
-        [InlineKeyboardButton("🤝 Лояльны / Работают", callback_data="tag:loyal")],
-        [InlineKeyboardButton("✍️ Сразу текст", callback_data="tag:freetext")],
-    ])
-    await query.message.reply_text(prompt, reply_markup=kb)
+    kb = InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("💸 Цена/Тариф", callback_data="tag:price")],
+            [InlineKeyboardButton("⚙️ Тех. проблемы/Баги", callback_data="tag:tech")],
+            [InlineKeyboardButton("🔄 Ушли к конкуренту", callback_data="tag:competitor")],
+            [InlineKeyboardButton("🤝 Лояльны / Работают", callback_data="tag:loyal")],
+            [InlineKeyboardButton("✍️ Сразу текст / фото", callback_data="tag:freetext")],
+        ]
+    )
+    await query.message.reply_text(prompt, parse_mode=ParseMode.MARKDOWN, reply_markup=kb)
     return WAITING_NOTE
 
 
 async def cb_tag_selected(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Выбор тега — переводим в WAITING_NOTE."""
     query = update.callback_query
     await query.answer()
     _, tag_key = query.data.split(":", 1)
@@ -698,23 +866,25 @@ async def cb_tag_selected(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     if tag_key == "freetext":
         await query.message.reply_text(
-            "✍️ Напишите, что сказали в магазине:"
+            "✍️ Напишите, что сказали в магазине (можно также отправить 📸 фото с подписью):"
         )
     else:
         await query.message.reply_text(
-            f"Тег: *{tag_label}*\n\n"
-            "Напишите, что сказали в магазине "
-            "(или отправьте *\\-* если без комментариев):",
+            f"Выбрана категория: *{_esc(tag_label)}*\n\n"
+            "Напишите детали разговора в магазине (можно прикрепить 📸 фото) "
+            "или отправьте *-* если без комментариев:",
             parse_mode=ParseMode.MARKDOWN,
         )
     return WAITING_NOTE
 
 
-async def handle_note_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Получен текст заметки — сохраняем и переходим к следующей точке."""
+async def _finalize_visit_record(update: Update, ctx: ContextTypes.DEFAULT_TYPE, note_text: str, photo_filename: str = ""):
     order = ctx.user_data.get("visit_order")
     tag = ctx.user_data.get("visit_tag", "")
-    note_text = update.message.text.strip()
+
+    if not order:
+        await update.message.reply_text("⚠️ Не указан номер точки для записи.", reply_markup=MAIN_KB)
+        return ConversationHandler.END
 
     if note_text == "-":
         note_text = ""
@@ -723,60 +893,89 @@ async def handle_note_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     p = _get_point_by_order(state, order)
 
     if p:
-        is_append = p["status"] == "visited"
-
-        if is_append and note_text:
-            # Дописываем к существующей заметке
-            old_notes = p.get("notes", "")
-            if old_notes:
-                p["notes"] = old_notes + "; " + note_text
-            else:
-                p["notes"] = note_text
-            # Обновляем тег если выбран новый
+        is_append = p.get("status") == "visited"
+        if is_append:
+            if note_text:
+                old_notes = p.get("notes", "")
+                p["notes"] = f"{old_notes}; {note_text}" if old_notes else note_text
             if tag and tag != "✍️ Сразу текст":
                 p["reason_tag"] = tag
+            if photo_filename:
+                p["photo"] = photo_filename
         else:
             p["status"] = "visited"
             p["visit_time"] = datetime.now().strftime("%Y-%m-%d %H:%M")
             if tag and tag != "✍️ Сразу текст":
                 p["reason_tag"] = tag
             p["notes"] = note_text
+            if photo_filename:
+                p["photo"] = photo_filename
 
         _save_state(state)
 
     await update.message.reply_text(
-        f"✅ Точка *{order}* сохранена\\!\n\n" + _progress_summary(state),
+        f"✅ Заметка по точке *{order}* сохранена!\n\n" + _progress_summary(state),
         parse_mode=ParseMode.MARKDOWN,
         reply_markup=MAIN_KB,
     )
 
-    # Проверяем завершение обхода
-    next_p = _first_pending(state)
+    next_p, _ = _next_to_visit(state)
     if next_p is None:
-        all_done = all(
-            pt["status"] != "pending" for pt in state.get("points", [])
+        await update.message.reply_text(
+            "🎉 *Все точки маршрута пройдены!*",
+            parse_mode=ParseMode.MARKDOWN,
         )
-        if all_done:
-            await update.message.reply_text(
-                "🎉 *Все точки маршрута пройдены\\!*",
-                parse_mode=ParseMode.MARKDOWN,
-            )
-            await _auto_send_report(update.message)
+        await _auto_send_report(update.message)
     else:
         await _send_point_card(update.message, state)
 
-    # Очищаем
     ctx.user_data.pop("visit_order", None)
     ctx.user_data.pop("visit_tag", None)
     return ConversationHandler.END
+
+
+async def handle_note_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    note_text = update.message.text.strip()
+    return await _finalize_visit_record(update, ctx, note_text)
+
+
+async def handle_note_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    PHOTOS_DIR.mkdir(exist_ok=True)
+    order = ctx.user_data.get("visit_order", 0)
+    photo = update.message.photo[-1]
+    tg_file = await ctx.bot.get_file(photo.file_id)
+    fname = f"point_{order}_{datetime.now():%Y%m%d_%H%M%S}.jpg"
+    await tg_file.download_to_drive(str(PHOTOS_DIR / fname))
+
+    caption = (update.message.caption or "").strip()
+    return await _finalize_visit_record(update, ctx, caption, photo_filename=fname)
 
 
 async def cancel_visit(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Отмена диалога визита."""
     ctx.user_data.pop("visit_order", None)
     ctx.user_data.pop("visit_tag", None)
-    await update.message.reply_text("❌ Отменено.", reply_markup=MAIN_KB)
+    await update.message.reply_text("❌ Запись заметки отменена.", reply_markup=MAIN_KB)
     return ConversationHandler.END
+
+
+async def cancel_and_start_walk(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await cancel_visit(update, ctx)
+    return await cmd_start_walk(update, ctx)
+
+
+async def cancel_and_show_all(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await cancel_visit(update, ctx)
+    return await cmd_show_all(update, ctx)
+
+
+async def cancel_and_download_report(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await cancel_visit(update, ctx)
+    return await cmd_download_report(update, ctx)
+
+
+async def cancel_and_reset(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await cancel_visit(update, ctx)
+    return await cmd_reset(update, ctx)
 
 
 # ── Скачать Excel-отчет ──────────────────────────────────
@@ -790,18 +989,17 @@ async def cmd_download_report(update: Update, _ctx: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    wait_msg = await update.message.reply_text("⏳ Формирую отчёт…")
-
+    wait_msg = await update.message.reply_text("⏳ Формирую актуальный Excel-отчёт…")
     try:
         report_path = export_report_xlsx()
         with open(report_path, "rb") as f:
             await update.message.reply_document(
                 document=InputFile(f, filename="Маршрут_Астана_отчет.xlsx"),
-                caption="📊 Итоговый Excel-отчёт обхода",
+                caption="📊 Итоговый Excel-отчёт обхода (с аналитикой оттока)",
             )
         await wait_msg.delete()
     except Exception as e:
-        await wait_msg.edit_text(f"❌ Ошибка: {e}")
+        await wait_msg.edit_text(f"❌ Ошибка формирования отчёта: {e}")
 
 
 # ── Сбросить прогресс ────────────────────────────────────
@@ -809,7 +1007,7 @@ async def cmd_download_report(update: Update, _ctx: ContextTypes.DEFAULT_TYPE):
 async def cmd_reset(update: Update, _ctx: ContextTypes.DEFAULT_TYPE):
     state = _load_state()
     if not state.get("points"):
-        await update.message.reply_text("Нечего сбрасывать.", reply_markup=MAIN_KB)
+        await update.message.reply_text("Маршрут ещё не загружен.", reply_markup=MAIN_KB)
         return
 
     for p in state["points"]:
@@ -817,10 +1015,11 @@ async def cmd_reset(update: Update, _ctx: ContextTypes.DEFAULT_TYPE):
         p["visit_time"] = ""
         p["reason_tag"] = ""
         p["notes"] = ""
+        p["photo"] = ""
     _save_state(state)
 
     await update.message.reply_text(
-        "🔄 Прогресс сброшен. Все точки снова в статусе «Ожидает».",
+        "🔄 Прогресс сброшен. Все точки снова в статусе «⏳ Ожидает».",
         reply_markup=MAIN_KB,
     )
 
@@ -840,21 +1039,22 @@ async def handle_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
 
     status = await update.message.reply_text("⏳ Загружаю файл…", reply_markup=MAIN_KB)
-
     try:
         tg_file = await ctx.bot.get_file(doc.file_id)
         await tg_file.download_to_drive(str(SRC_FILE))
     except Exception as e:
-        await status.edit_text(f"❌ Не удалось скачать файл: {e}")
+        await status.edit_text(
+            f"❌ Не удалось сохранить файл: {e}\n"
+            "Если файл открыт в Excel на компьютере — пожалуйста, закройте его."
+        )
         return
 
-    await status.edit_text(
-        "🔄 Считаю маршрут…\nПоиск адресов ≈ 1 сек/адрес, подождите ⏳"
-    )
+    await status.edit_text("🔄 Считаю оптимальный маршрут по дорогам Астаны… ⏳")
 
     try:
         proc = await asyncio.create_subprocess_exec(
-            PYTHON, str(SCRIPT),
+            PYTHON,
+            str(SCRIPT),
             cwd=str(WORK_DIR),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
@@ -876,28 +1076,26 @@ async def handle_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # Инициализируем visit_state.json
-    _init_state_from_route()
+    state = _init_state_from_route()
     ctx.user_data["has_route"] = True
-    await status.edit_text("✅ Маршрут готов!")
+    await status.edit_text("✅ Маршрут успешно рассчитан!")
 
-    # Отправляем файл
-    with open(OUT_FILE, "rb") as f:
-        await update.message.reply_document(
-            document=InputFile(f, filename="Маршрут_Астана_готовый.xlsx"),
-            caption="📎 Файл маршрута",
-        )
+    cur_file = _get_out_file()
+    if cur_file.exists():
+        with open(cur_file, "rb") as f:
+            await update.message.reply_document(
+                document=InputFile(f, filename="Маршрут_Астана_готовый.xlsx"),
+                caption="📎 Готовый маршрут со ссылками Google Maps и 2ГИС",
+            )
 
-    # Лог расчёта
     if output.strip():
-        if len(output) > 3800:
-            output = output[:3800] + "\n…"
+        if len(output) > 3500:
+            output = output[:3500] + "\n…"
         await update.message.reply_text(
-            f"📝 *Лог расчёта:*\n```\n{output}\n```",
+            f"📝 *Лог геокодинга и расчёта:*\n```\n{output}\n```",
             parse_mode=ParseMode.MARKDOWN,
         )
 
-    state = _load_state()
     await update.message.reply_text(
         _progress_summary(state) + "\n\nНажмите *▶️ Начать / Продолжить обход*",
         parse_mode=ParseMode.MARKDOWN,
@@ -908,10 +1106,6 @@ async def handle_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 # ── Обработка геолокации — пересчёт маршрута ─────────────
 
 async def handle_location(update: Update, _ctx: ContextTypes.DEFAULT_TYPE):
-    """
-    При получении геолокации: пересчитывает порядок оставшихся
-    (pending + skipped) точек от текущей позиции через OSRM.
-    """
     loc = update.message.location
     lat, lon = loc.latitude, loc.longitude
 
@@ -924,91 +1118,98 @@ async def handle_location(update: Update, _ctx: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # Отфильтровываем remaining (pending + skipped) с координатами
     remaining = [
-        p for p in points
-        if p["status"] in ("pending", "skipped") and p.get("lat") and p.get("lon")
+        p
+        for p in points
+        if p.get("status") in ("pending", "skipped") and p.get("lat") and p.get("lon")
+    ]
+    remaining_no_coords = [
+        p
+        for p in points
+        if p.get("status") in ("pending", "skipped") and not (p.get("lat") and p.get("lon"))
     ]
 
-    if not remaining:
+    if not remaining and not remaining_no_coords:
         await update.message.reply_text(
-            "✅ Все точки уже обработаны, пересчитывать нечего.",
+            "✅ Все точки уже пройдены, пересчитывать нечего.",
             reply_markup=MAIN_KB,
         )
         return
 
     wait_msg = await update.message.reply_text(
-        f"📍 Ваши координаты: {lat:.6f}, {lon:.6f}\n"
-        f"🔄 Пересчитываю маршрут для {len(remaining)} оставшихся точек…"
+        f"📍 Ваша геопозиция: {lat:.5f}, {lon:.5f}\n"
+        f"🔄 Перестраиваю оптимальный порядок для {len(remaining)} оставшихся точек…"
     )
 
-    try:
-        # Импортируем функции из route_planner
-        sys.path.insert(0, str(WORK_DIR))
-        from route_planner import reroute_remaining
+    ordered, minutes = [], []
+    if remaining:
+        try:
+            sys.path.insert(0, str(WORK_DIR))
+            from route_planner import reroute_remaining
 
-        # Подготавливаем точки для route_planner (нужен формат с xy)
-        rp_points = []
-        for p in remaining:
-            rp_points.append({
-                "order": p["order"],
-                "name": p["name"],
-                "addr": p["addr"],
-                "owner": p["owner"],
-                "contact": p["contact"],
-                "phone": p["phone"],
-                "xy": (p["lat"], p["lon"]),
-                "src": p["src"],
-                # Сохраняем данные визита
-                "_status": p["status"],
-                "_visit_time": p.get("visit_time", ""),
-                "_reason_tag": p.get("reason_tag", ""),
-                "_notes": p.get("notes", ""),
-                "_gmaps": p.get("gmaps", ""),
-                "_dgis": p.get("dgis", ""),
-            })
+            rp_points = []
+            for p in remaining:
+                rp_points.append(
+                    {
+                        "order": p["order"],
+                        "name": p.get("name", ""),
+                        "addr": p.get("addr", ""),
+                        "owner": p.get("owner", ""),
+                        "contact": p.get("contact", ""),
+                        "phone": p.get("phone", ""),
+                        "xy": (p["lat"], p["lon"]),
+                        "src": p.get("src", ""),
+                        "_status": p.get("status", "pending"),
+                        "_visit_time": p.get("visit_time", ""),
+                        "_reason_tag": p.get("reason_tag", ""),
+                        "_notes": p.get("notes", ""),
+                        "_photo": p.get("photo", ""),
+                        "_gmaps": p.get("gmaps", ""),
+                        "_dgis": p.get("dgis", ""),
+                    }
+                )
 
-        ordered, minutes = reroute_remaining(lat, lon, rp_points)
+            ordered, minutes = reroute_remaining(lat, lon, rp_points)
+        except Exception as e:
+            await wait_msg.edit_text(f"❌ Ошибка пересчёта: {e}")
+            return
+    else:
+        ordered, minutes = [], []
 
-    except Exception as e:
-        await wait_msg.edit_text(f"❌ Ошибка пересчёта: {e}")
-        return
+    visited_closed = [p for p in points if p.get("status") in ("visited", "closed")]
+    new_points = list(visited_closed)
 
-    # Сохраняем visited/closed точки без изменений,
-    # remaining — в новом порядке с пересчитанным временем
-    visited_closed = [p for p in points if p["status"] in ("visited", "closed")]
-
-    new_points = []
-    # Сначала — уже обработанные (сохраняем их порядок)
-    for p in visited_closed:
-        new_points.append(p)
-
-    # Потом — пересортированные remaining
-    cumulative = 0
+    cumulative = visited_closed[-1].get("total", 0) if visited_closed else 0
     for idx, (rp, m) in enumerate(zip(ordered, minutes)):
         cumulative += m
         new_order = len(visited_closed) + idx + 1
-        new_points.append({
-            "order": new_order,
-            "name": rp["name"],
-            "addr": rp["addr"],
-            "owner": rp["owner"],
-            "contact": rp["contact"],
-            "phone": rp["phone"],
-            "mins": round(m),
-            "total": round(cumulative),
-            "src": rp["src"],
-            "gmaps": rp.get("_gmaps", ""),
-            "dgis": rp.get("_dgis", ""),
-            "lat": rp["xy"][0],
-            "lon": rp["xy"][1],
-            "status": rp.get("_status", "pending"),
-            "visit_time": rp.get("_visit_time", ""),
-            "reason_tag": rp.get("_reason_tag", ""),
-            "notes": rp.get("_notes", ""),
-        })
+        new_points.append(
+            {
+                "order": new_order,
+                "name": rp["name"],
+                "addr": rp["addr"],
+                "owner": rp["owner"],
+                "contact": rp["contact"],
+                "phone": rp["phone"],
+                "mins": round(m),
+                "total": round(cumulative),
+                "src": rp["src"],
+                "gmaps": rp.get("_gmaps", ""),
+                "dgis": rp.get("_dgis", ""),
+                "lat": rp["xy"][0],
+                "lon": rp["xy"][1],
+                "status": rp.get("_status", "pending"),
+                "visit_time": rp.get("_visit_time", ""),
+                "reason_tag": rp.get("_reason_tag", ""),
+                "notes": rp.get("_notes", ""),
+                "photo": rp.get("_photo", ""),
+            }
+        )
 
-    # Пересчитываем порядок для всех
+    # Добавляем оставшиеся точки без координат в конец маршрута, чтобы они не терялись
+    for p in remaining_no_coords:
+        new_points.append(p)
+
     for i, p in enumerate(new_points, 1):
         p["order"] = i
 
@@ -1016,14 +1217,10 @@ async def handle_location(update: Update, _ctx: ContextTypes.DEFAULT_TYPE):
     _save_state(state)
 
     await wait_msg.edit_text(
-        f"✅ Маршрут пересчитан от вашей позиции!\n"
-        f"📍 {lat:.4f}, {lon:.4f}\n"
-        f"Осталось точек: {len(ordered)}\n\n"
-        + _progress_summary(state),
+        f"✅ *Маршрут перестроен от вашей текущей позиции!*\n"
+        f"Осталось точек: *{len(ordered) + len(remaining_no_coords)}*\n\n" + _progress_summary(state),
         parse_mode=ParseMode.MARKDOWN,
     )
-
-    # Показываем первую pending точку
     await _send_point_card(update.message, state)
 
 
@@ -1032,9 +1229,11 @@ async def handle_location(update: Update, _ctx: ContextTypes.DEFAULT_TYPE):
 # ══════════════════════════════════════════════════════════
 
 def main():
+    if OUT_FILE.exists() and not STATE_FILE.exists():
+        _init_state_from_route()
+
     app = Application.builder().token(TOKEN).build()
 
-    # ConversationHandler для диалога визита
     visit_conv = ConversationHandler(
         entry_points=[
             CallbackQueryHandler(cb_visit_start, pattern=r"^visit:\d+$"),
@@ -1042,44 +1241,39 @@ def main():
         states={
             WAITING_NOTE: [
                 CallbackQueryHandler(cb_tag_selected, pattern=r"^tag:"),
-                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_note_text),
+                MessageHandler(filters.PHOTO, handle_note_photo),
+                # Не перехватываем системные кнопки главного меню
+                MessageHandler(
+                    filters.TEXT & ~filters.COMMAND & ~filters.Regex(r"^(🔄|▶️|📋|📊)"),
+                    handle_note_text,
+                ),
             ],
         },
         fallbacks=[
             CommandHandler("cancel", cancel_visit),
-            MessageHandler(filters.Regex(r"^🔄"), cancel_visit),
+            MessageHandler(filters.Regex(r"^▶️"), cancel_and_start_walk),
+            MessageHandler(filters.Regex(r"^📋"), cancel_and_show_all),
+            MessageHandler(filters.Regex(r"^📊"), cancel_and_download_report),
+            MessageHandler(filters.Regex(r"^🔄"), cancel_and_reset),
         ],
         per_message=False,
     )
 
     app.add_handler(visit_conv)
-
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("route", cmd_show_all))
 
-    # Reply-клавиатура
-    app.add_handler(MessageHandler(
-        filters.Regex(r"^▶️"), cmd_start_walk
-    ))
-    app.add_handler(MessageHandler(
-        filters.Regex(r"^📋"), cmd_show_all
-    ))
-    app.add_handler(MessageHandler(
-        filters.Regex(r"^📊"), cmd_download_report
-    ))
-    app.add_handler(MessageHandler(
-        filters.Regex(r"^🔄"), cmd_reset
-    ))
-
-    # Inline callback'и (навигация, skip, closed)
+    app.add_handler(CallbackQueryHandler(cb_city_select, pattern=r"^city:"))
     app.add_handler(CallbackQueryHandler(cb_navigation, pattern=r"^nav:\d+$"))
     app.add_handler(CallbackQueryHandler(cb_skip, pattern=r"^skip:\d+$"))
     app.add_handler(CallbackQueryHandler(cb_closed, pattern=r"^closed:\d+$"))
 
-    # Документы (xlsx)
-    app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
+    app.add_handler(MessageHandler(filters.Regex(r"^▶️"), cmd_start_walk))
+    app.add_handler(MessageHandler(filters.Regex(r"^📋"), cmd_show_all))
+    app.add_handler(MessageHandler(filters.Regex(r"^📊"), cmd_download_report))
+    app.add_handler(MessageHandler(filters.Regex(r"^🔄"), cmd_reset))
 
-    # Геолокация
+    app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
     app.add_handler(MessageHandler(filters.LOCATION, handle_location))
 
     log.info("🤖 Бот запущен, ожидаю сообщения…")
