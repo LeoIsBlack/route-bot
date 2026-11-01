@@ -8,10 +8,13 @@ __pycache__/
 *.py[cod]
 
 # Локальные данные обхода (чтобы не перезатирать визиты с другого устройства)
-visit_state.json
+data/
+visit_state*.json
 Маршрут_Астана_отчет*.xlsx
 geocode_cache.json
 manual_coords.csv
+photos/
+*.tmp
 
 # Системные файлы
 .DS_Store
